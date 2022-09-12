@@ -74,3 +74,146 @@ Radix Tree 是属于前缀树的一种类型。前缀树也称为 Trie Tree，�
 另外从图中，我们还可以看到，前缀树是把保存的 key 的公共前缀（即 r、e、a）独立出来共享使用的。这样一来，就可以避免在树中对相同的字符做重复存储。
 
 而如果不采用这种方法，只是把这两个 key 保存在哈希表中，那么 key 的相同前缀就会被单独存储，这样就会导致内存空间的浪费。所以，相比哈希表的保存方式，前缀树能够很好地节省内存空间，这对于 Redis 来说是非常重要的。
+
+
+### 前缀树的不足和 Radix Tree 的改进
+
+当然，前缀树在每个节点中只保存一个字符，这样做的好处就是可以尽可能地共享不同 key 的公共前缀。但是，这也会导致 key 中的某些字符串，虽然不再被共享，可仍然会按照每个节点一个字符的形式来保存，这样反而会造成空间的浪费和查询性能的降低。
+
+我来给你举个例子，假设有 5 个 key，分别是 radix、race、read、real 和 redis，它们在前缀树上的布局如下图所示。
+![img_5.png](img_5.png)
+
+对于“redis”来说，因为它和“read”“real”共享“r”和“e”，和“radix”“race”共享“r”，也就是说“r”和“e”节点都分别指向多个子节点。类似的，“real”和“read”共享了“r”“e”和“a”前缀，“a”节点也指向了多个子节点。所以，在前缀树的节点中单独保存“r”“e”“a”是很有必要的。
+
+但是，我们还是看“redis”这个 key，除了“r”“e”字符和其他 key 有共享外，“re”后面的“dis”没有再被其他 key 共享了。所以此时，其实并没有必要再对“dis”进行拆分，将其分成单个字符“d”“i”和“s”来保存，而是可以把它们合并在一起保存。
+
+那么到这里，你就可以发现，在前缀树上，确实有的字符需要单独保存，用来作为不同 key 的公共前缀进行共享，但其实有的单字符节点可以和其他单字符节点进行合并，这样能进一步节省空间。
+
+
+而从一个更加通用的角度来说，在前缀树的某个节点开始，如果从该节点到另外一个节点之间，每一个节点都只有一个子节点，那就表明这些节点对应的字符，并没有和其他节点共享了。那么如果我们还是按照前缀树的方式，为每一个字符创建一个节点进行保存的话，一是会浪费内存空间，二是在进行查询时，还需要逐一匹配每个节点表示的字符，对查询性能也会造成影响。
+
+所以，在前缀树中，如果一系列单字符节点之间的分支连接是唯一的，那么这些单字符节点就可以合并成一个节点，而这种结构的树，就正是 Radix Tree，也被称为基数树。相比前缀树来说，Radix Tree 既可以节约内存的使用，同时还可以提高查询访问的效率。
+
+我画了下面这张图，展示了刚才介绍的前缀树上的 5 个 key（radix、race、read、real 和 redis），在 Radix Tree 上的布局，你可以对照着看下它们在前缀树布局上的不同之处。
+![img_6.png](img_6.png)
+
+
+### Radix Tree 数据结构
+
+好了，从刚才介绍的 Radix Tree 的结构中，我们其实可以发现，在 Radix Tree 中存在两类节点。
+
+
+第一类节点是非压缩节点，这类节点会包含多个指向不同子节点的指针，以及多个子节点所对应的字符，比如前面 Radix Tree 例子中的节点“r”，这个节点就包含了指向子节点“a”和“e”的指针。同时，如果从根节点到一个非压缩节点的路径上的字符串，已经对应了 Radix Tree 中保存的一个 key，那么这个非压缩节点中还包含了指向这个 key 对应的 value 的指针。
+
+比如，下面这张图就显示了刚才例子中的节点 r，它是一个非压缩节点，指向了两个子节点，这两个子节点对应的字符分别是“a”和“e”，这个非压缩节点包含了指向子节点 a 和 e 的指针。此外，非压缩节点头部保存的 HDR，是 Radix Tree 节点数据结构中的元数据，我一会儿会给你具体介绍它。
+
+
+![img_7.png](img_7.png)
+
+
+
+
+第二类节点是压缩节点，这类节点会包含一个指向子节点的指针，以及子节点所代表的合并的字符串。比如前面 Radix Tree 例子中的节点 e，这个节点指向的子节点包含的字符串就是合并的字符串“dis”。和非压缩节点类似，如果从根节点到一个压缩节点的路径上的字符串，已经对应了 Radix Tree 中保存的一个 key，那么，这个压缩节点中还包含指向这个 key 对应的 value 的指针。
+
+下图展示的就是一个压缩节点，它包含一个指向子节点的指针，这个子节点表示的合并字符串是“is”，所以在当前这个压缩节点中，保存了合并字符“is”。而和非压缩节点类似，压缩节点的头部 HDR，保存的也是 Radix Tree 节点结构中的元数据。
+
+
+```angular2html
+
+typedef struct raxNode {
+    uint32_t iskey:1;     //节点是否包含key
+    uint32_t isnull:1;    //节点的值是否为NULL
+    uint32_t iscompr:1;   //节点是否被压缩
+    uint32_t size:29;     //节点大小
+    unsigned char data[]; //节点的实际存储数据
+} raxNode;
+```
+
+该结构中的成员变量包括 4 个元数据，这四个元数据的含义分别如下。
+- 它们所代表的 key，是从根节点到当前节点路径上的字符串，但并不包含当前节点；
+- 它们本身就已经包含了子节点代表的字符或合并字符串。而对于它们的子节点来说，也都属于非压缩或压缩节点，所以，子节点本身又会保存，子节点的子节点所代表的字符或合并字符串。
+
+而这两个特点就给 Radix Tree 实际保存数据时的结构，带来了两个方面的变化。
+
+一方面，Radix Tree 非叶子节点，要不然是压缩节点，只指向单个子节点，要不然是非压缩节点，指向多个子节点，但每个子节点只表示一个字符。所以，非叶子节点无法同时指向表示单个字符的子节点和表示合并字符串的子节点。
+
+我给你举个例子，在下图的左半部分，节点 r 的子节点 a，它的两个子节点表示的都是合并字符串“dix”和“ce”。因此，节点 a 的 raxNode 结构，无法同时指向 dix 子节点和 ce 子节点。类似的，r 节点的子节点 e，它的两个子节点，一个表示的是单字符“a”，另一个表示的是合并字符串“dis”，节点 e 的 raxNode 结构也无法同时指向这两个子节点。
+
+所以，在实际使用 raxNode 结构保存数据时，节点 dix 会被拆为节点 d 和 ix，节点 ce 会被拆为节点 c 和 e，节点 dis 会被拆为节点 d 和 is，如下图的右半部分所示。这样一来，节点 r 的子节点 a 和 e，就可以用非压缩节点的结构来保存了。
+
+![img_8.png](img_8.png)
+
+我们再来看另一方面，对于 Radix Tree 的叶子节点来说，因为它没有子节点了，所以，Redis 会用一个不包含子节点指针的 raxNode 节点来表示叶子节点，也就是说，叶子节点的 raxNode 元数据 size 为 0，没有子节点指针。如果叶子节点代表了一个 key，那么它的 raxNode 中是会保存这个 key 的 value 指针的。
+
+为了便于你理解非压缩节点、压缩节点和叶子节点的 raxNode 结构内容，我画了下面这张图，你可以看下。
+
+![img_9.png](img_9.png)
+
+这张图上显示了 Radix Tree 最右侧分支的 4 个节点 r、e、d、is 和它们各自的 raxNode 内容。其中，节点 r、e 和 d 都不代表 key，所以它们的 iskey 值为 0，isnull 值为 1，没有为 value 指针分配空间。
+
+节点 r 和 e 指向的子节点都是单字符节点，所以它们不是压缩节点，iscompr 值为 0。而节点 d 的子节点包含了合并字符串“is”，所以该节点是压缩节点，iscompr 值为 1。最后的叶子节点 is，它的 raxNode 的 size 为 0，没有子节点指针。不过，因为从根节点到节点 is 路径上的字符串代表了 key“redis”，所以，节点 is 的 value 指针指向了“redis”对应的 value 数据。
+
+
+
+
+### Radix Tree 的操作函数
+
+该函数的原型如下，它会调用 rax_malloc 函数分配一个新的 rax 结构体空间。
+```angular2html
+rax *raxNew(void)
+```
+rax 结构体的定义如下所示，其中包含了 Radix Tree 中的 key 个数、节点个数，以及指向头节点的指针，而 raxNew 函数会调用 raxNewNode 函数来创建头节点。
+
+```angular2html
+
+typedef struct rax {
+    raxNode *head;  //Radix Tree的头指针
+    uint64_t numele;  //Radix Tree中key的个数
+    uint64_t numnodes; //Radix Tree中raxNode的个数
+} rax;
+```
+
+
+
+
+该函数的原型如下，用来创建一个新的非压缩节点。它的参数 children 表示该非压缩节点的子节点个数，参数 datafield 表示是否要为 value 指针分配空间。raxNode *raxNewNode(size_t children, int datafield)
+
+- raxGenericInsert 函数该函数原型如下，用来向 Radix Tree 中插入一个长度为 len 的字符串 s。
+```angular2html
+int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old, int overwrite) 
+```
+- raxLowWalk 函数 该函数原型如下，当需要在 Radix Tree 中查找、插入或是删除节点时，都会调用该函数。
+```
+static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, raxStack *ts)
+```
+- 这两个函数的原型如下所示，它们分别用来获得 raxNode 中保存的 value 指针，以及设置 raxNode 中保存的 value 指针。
+```angular2html
+
+void *raxGetData(raxNode *n) 
+void raxSetData(raxNode *n, void *data)
+```
+
+### Stream 如何组合使用 Radix Tree 和 listpack？
+
+我们知道，Stream 保存的消息数据，按照 key-value 形式来看的话，消息 ID 就相当于 key，而消息内容相当于是 value。也就是说，Stream 会使用 Radix Tree 来保存消息 ID，然后将消息内容保存在 listpack 中，并作为消息 ID 的 value，用 raxNode 的 value 指针指向对应的 listpack。
+
+这里我放了一张图，展示了 Stream 结构、rax、raxNode 以及 listpack 相互之间的关系。注意，在这张图中，我们假设就只有一个 streamID 作为 key。
+
+![img_10.png](img_10.png)
+
+我们可以看到，stream 结构体中的 rax 指针，指向了 Radix Tree 的头节点，也就是 rax 结构体。rax 结构体中的头指针进一步指向了第一个 raxNode。因为我们假设就只有一个 streamID，暂时没有其他 streamID 和该 streamID 共享前缀，所以，当前这个 streamID 就可以用压缩节点保存。
+
+然后，第一个 raxNode 指向了下一个 raxNode，也是 Radix Tree 的叶子节点。这个节点的 size 为 0，它的 value 指针指向了实际的消息内容。
+
+而在消息内容这里，是使用了 listpack 进行保存的。你可以看到，listpack 中是使用了 master entry 来保存键值对类型消息中的键，而值会在 master entry 后面保存。这种保存方式其实也是为了节省内存空间，这是因为很多消息的键是相同的，保存一份就行。关于在 Stream 中，将消息的键和值分开保存到 listpack 中的这种设计方法，我会在后面的课程中继续给你详细介绍。
+
+它们的相同之处在于：
+- 都有保存元数据的节点头 HDR；
+- 都会包含指向子节点的指针，以及子节点所代表的字符串。
+- 从根节点到当前节点路径上的字符串如果是 Radix Tree 的一个 key，它们都会包含指向 key 对应 value 的指针。
+
+不同之处在于：
+- 非压缩节点指向的子节点，每个子节点代表一个字符，非压缩节点可以指向多个子节点；
+- 压缩节点指向的子节点，代表的是一个合并字符串，压缩节点只能指向一个子节点。
+- 
+
